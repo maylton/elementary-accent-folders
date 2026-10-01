@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+elementary-accent-folders
+=========================
+
+Make the folder icons of elementary OS follow the system accent color.
+
+It generates lightweight variants of the elementary icon theme
+(elementary-grape, elementary-mint, ...) that contain ONLY recolored folder
+icons (plus the Files app icon) and inherit everything else from the original
+theme (Inherits=elementary). A small watcher switches the variant whenever the
+accent color changes, including the "Automatic" (wallpaper-based) accent.
+
+Quick start:
+    elementary-accent-folders --install-autostart   # automatic mode (recommended)
+    elementary-accent-folders --status              # what is detected right now
+    elementary-accent-folders --sync                # apply the matching color once
+    elementary-accent-folders grape mint            # only generate variants
+    elementary-accent-folders --apply grape         # generate and activate a fixed color
+    elementary-accent-folders --remove              # undo everything
+
+How detection works: io.elementary.settings-daemon writes the chosen accent
+(also the wallpaper-based "Automatic" one) to the key
+org.gnome.desktop.interface gtk-theme as "io.elementary.stylesheet.<color>".
+The --watch mode listens to that key with `gsettings monitor`.
+"""
+
+import argparse
+import configparser
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+APP = "elementary-accent-folders"
+VERSION = "1.0.0"
+
+# Official elementary palette (100, 300, 500, 700, 900)
+PALETTE = {
+    "strawberry": ["#ff8c82", "#ed5353", "#c6262e", "#a10705", "#7a0000"],
+    "orange":     ["#ffc27d", "#ffa154", "#f37329", "#cc3b02", "#a62100"],
+    "banana":     ["#fff394", "#ffe16b", "#f9c440", "#d48e15", "#ad5f00"],
+    "lime":       ["#d1ff82", "#9bdb4d", "#68b723", "#3a9104", "#206b00"],
+    "mint":       ["#89ffdd", "#43d6b5", "#28bca3", "#0e9a83", "#007367"],
+    "blueberry":  ["#8cd5ff", "#64baff", "#3689e6", "#0d52bf", "#002e99"],
+    "grape":      ["#e4c6fa", "#cd9ef7", "#a56de2", "#7239b3", "#452981"],
+    "bubblegum":  ["#fe9ab8", "#f4679d", "#de3e80", "#bc245d", "#910e38"],
+    "cocoa":      ["#a3907c", "#8a715e", "#715344", "#57392d", "#3d211b"],
+    "slate":      ["#95a3ab", "#667885", "#485a6c", "#273445", "#0e141f"],
+}
+
+# Original "manila" folder shades -> palette index (0=100 ... 4=900).
+# The default mapping is the same one the elementary designers used for the
+# purple "folder-saved-search" icon (Latte -> Grape).
+MAP_VIVID = {"#efdfc4": 0, "#e7c591": 2, "#b6802e": 3, "#987124": 3, "#7e5514": 4}
+MAP_PASTEL = {"#efdfc4": 0, "#e7c591": 1, "#b6802e": 2, "#987124": 3, "#7e5514": 4}
+MANILA = tuple(MAP_VIVID)
+
+ACTIONS_WHITELIST = re.compile(
+    r"^(folder-(new|copy|move)|document-open|document-save-as)(-rtl)?\.svg$"
+)
+
+# Files app icon (app launcher, dock). It is blue (Blueberry) in the original
+# theme, so it is recolored shade by shade.
+FILES_APP_ICON = "system-file-manager.svg"
+FILES_APP_ALIASES = ("io.elementary.files.svg",)
+MAP_BLUEBERRY = {"#8cd5ff": 0, "#64baff": 1, "#3689e6": 2, "#0d52bf": 3,
+                 "#002e99": 4, "#0099e5": 2}
+
+CONTEXT_DIRS = ("places", "actions", "apps")
+HEX = re.compile(r"#[0-9a-fA-F]{6}\b")
+
+# Bump when the generated output changes: older variants are rebuilt automatically.
+GENERATOR_VERSION = 3
+VERSION_KEY = "X-AccentFolders-Version"
+
+STYLESHEET_PREFIX = "io.elementary.stylesheet."
+# System accents without a variant fall back to the original theme (manila folders).
+ACCENT_FALLBACK = {"latte": "elementary"}
+
+DEFAULT_SOURCE = "/usr/share/icons/elementary"
+DEFAULT_DEST = os.path.expanduser("~/.local/share/icons")
+BIN_PATH = os.path.expanduser(f"~/.local/bin/{APP}")
+AUTOSTART = os.path.expanduser(f"~/.config/autostart/{APP}.desktop")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache")
+PIDFILE = os.path.join(RUNTIME, f"{APP}.pid")
+LOGFILE = os.path.expanduser(f"~/.cache/{APP}.log")
+
+# Pre-release name of this project; cleaned up automatically on install/remove.
+LEGACY_APP = "elementary-folder-colors"
+LEGACY_BIN = os.path.expanduser(f"~/.local/bin/{LEGACY_APP}")
+LEGACY_AUTOSTART = os.path.expanduser(f"~/.config/autostart/{LEGACY_APP}.desktop")
+LEGACY_PIDFILE = os.path.join(RUNTIME, f"{LEGACY_APP}.pid")
+
+
+def log(msg):
+    print(time.strftime("[%H:%M:%S] ") + msg, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Variant generation
+# --------------------------------------------------------------------------
+
+def recolor(svg, pal, mapping):
+    def sub(m):
+        h = m.group(0).lower()
+        return pal[mapping[h]] if h in mapping else m.group(0)
+    return HEX.sub(sub, svg)
+
+
+def uses_manila(svg):
+    low = svg.lower()
+    return any(c in low for c in MANILA)
+
+
+def wanted(context, name):
+    if not name.endswith(".svg"):
+        return False
+    if context == "actions":
+        return bool(ACTIONS_WHITELIST.match(name))
+    if context == "apps":
+        return name == FILES_APP_ICON
+    return True
+
+
+def mapping_for(context, svg, pastel):
+    """Color table to use for this icon (None = leave it alone)."""
+    if context == "apps":
+        return MAP_BLUEBERRY
+    if uses_manila(svg):
+        return MAP_PASTEL if pastel else MAP_VIVID
+    return None
+
+
+def read_index(src):
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    cp.read(os.path.join(src, "index.theme"), encoding="utf-8")
+    return cp
+
+
+def theme_id_for(color, pastel):
+    return f"elementary-{color}" + ("-pastel" if pastel else "")
+
+
+def build_variant(src, dest_root, color, pastel=False):
+    pal = PALETTE[color]
+    theme_id = theme_id_for(color, pastel)
+    out = os.path.join(dest_root, theme_id)
+
+    if os.path.exists(out):
+        shutil.rmtree(out)
+    os.makedirs(out)
+
+    index = read_index(src)
+    all_dirs = [d for d in index["Icon Theme"]["Directories"].split(",") if d]
+
+    used_dirs = []
+    count = 0
+    for d in all_dirs:
+        top = d.split("/")[0]
+        context = top.split("@")[0]
+        if context not in CONTEXT_DIRS or d.endswith("symbolic"):
+            continue
+        if "@" in top:
+            used_dirs.append(d)  # places@2x/48 -> resolved through a symlink
+            continue
+
+        src_dir = os.path.join(src, d)
+        if not os.path.isdir(src_dir):
+            continue
+        dst_dir = os.path.join(out, d)
+
+        written, links = set(), []
+        for name in sorted(os.listdir(src_dir)):
+            if not wanted(context, name):
+                continue
+            path = os.path.join(src_dir, name)
+            if os.path.islink(path):
+                target = os.readlink(path)
+                if "/" not in target:
+                    links.append((name, target))
+                    continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    svg = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            mapping = mapping_for(context, svg, pastel)
+            if mapping is None:
+                continue
+            os.makedirs(dst_dir, exist_ok=True)
+            with open(os.path.join(dst_dir, name), "w", encoding="utf-8") as f:
+                f.write(recolor(svg, pal, mapping))
+            written.add(name)
+            count += 1
+
+        if context == "apps" and FILES_APP_ICON in written:
+            for alias in FILES_APP_ALIASES:
+                if not os.path.lexists(os.path.join(src_dir, alias)):
+                    links.append((alias, FILES_APP_ICON))
+
+        for name, target in links:
+            if target in written:
+                os.symlink(target, os.path.join(dst_dir, name))
+                count += 1
+
+        if os.path.isdir(dst_dir):
+            used_dirs.append(d)
+
+    for d in used_dirs:
+        top = d.split("/")[0]
+        if "@" in top:
+            link = os.path.join(out, top)
+            if not os.path.lexists(link):
+                os.symlink(top.split("@")[0], link)
+
+    used_dirs = [d for d in used_dirs
+                 if os.path.isdir(os.path.join(out, d.split("/")[0].split("@")[0],
+                                               d.split("/")[1]))]
+
+    pretty = color.capitalize() + (" Pastel" if pastel else "")
+    lines = [
+        "[Icon Theme]",
+        f"Name=elementary {pretty}",
+        f"Comment=elementary with {pretty} folders",
+        "Inherits=elementary",
+        "Example=folder",
+        f"{VERSION_KEY}={GENERATOR_VERSION}",
+        "Directories=" + ",".join(used_dirs),
+        "",
+    ]
+    for d in used_dirs:
+        if d in index:
+            lines.append(f"[{d}]")
+            lines += [f"{k}={v}" for k, v in index[d].items()]
+            lines.append("")
+    with open(os.path.join(out, "index.theme"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    for tool in ("gtk-update-icon-cache", "gtk4-update-icon-cache"):
+        if shutil.which(tool):
+            subprocess.run([tool, "-q", "-f", "-t", out], check=False)
+            break
+
+    return theme_id, count
+
+
+def ensure_variant(src, dest, color, pastel):
+    """Build the variant if it is missing, if the original theme was updated,
+    or if it was built by an older version of this script."""
+    out = os.path.join(dest, theme_id_for(color, pastel), "index.theme")
+    src_index = os.path.join(src, "index.theme")
+    stale = (not os.path.isfile(out)
+             or os.path.getmtime(src_index) > os.path.getmtime(out))
+    if not stale:
+        with open(out, encoding="utf-8") as f:
+            stale = f"{VERSION_KEY}={GENERATOR_VERSION}" not in f.read()
+    if stale:
+        theme_id, n = build_variant(src, dest, color, pastel)
+        log(f"built variant: {theme_id} ({n} icons)")
+
+
+# --------------------------------------------------------------------------
+# Overlay of the "elementary" theme (for the panel)
+#
+# Wingpanel hard-codes the icon theme (gtk_icon_theme_name = "elementary")
+# and ignores the system setting, so the Applications Menu never sees the
+# variants.
+#
+# Workaround: create ~/.local/share/icons/elementary holding a copy of the
+# original index.theme plus symlinks to the recolored directories of the active
+# variant. GTK 3 merges this directory with /usr/share/icons/elementary and
+# prefers the user one, so only the folders and the Files icon change; every
+# other icon still comes from the system theme.
+# --------------------------------------------------------------------------
+
+OVERLAY_MARKER = "X-AccentFolders-Overlay=true"
+OVERLAY_MARKERS = (OVERLAY_MARKER, "X-FolderColors-Overlay=true")  # + legacy
+
+
+def overlay_path(dest):
+    return os.path.join(dest, "elementary")
+
+
+def overlay_state(dest):
+    """'none' (missing), 'ours' (created by this script) or 'foreign'."""
+    path = overlay_path(dest)
+    if not os.path.lexists(path):
+        return "none"
+    try:
+        with open(os.path.join(path, "index.theme"), encoding="utf-8") as f:
+            text = f.read()
+            if any(m in text for m in OVERLAY_MARKERS):
+                return "ours"
+    except OSError:
+        pass
+    return "foreign"
+
+
+def overlay_target(dest):
+    link = os.path.join(overlay_path(dest), "places")
+    if os.path.islink(link):
+        return os.readlink(link).split("/")[1]
+    return None
+
+
+def remove_overlay(dest):
+    if overlay_state(dest) == "ours":
+        shutil.rmtree(overlay_path(dest))
+        return True
+    return False
+
+
+_warned_foreign = False
+
+
+def update_overlay(src, dest, theme_id):
+    """Point the overlay at variant theme_id (None = remove it).
+    Returns True if anything changed."""
+    global _warned_foreign
+    state = overlay_state(dest)
+    if state == "foreign":
+        if not _warned_foreign:
+            log(f"{overlay_path(dest)} exists and was not created by {APP}; "
+                "the panel will keep its original colors")
+            _warned_foreign = True
+        return False
+    if theme_id is None:
+        return remove_overlay(dest)
+
+    variant = os.path.join(dest, theme_id)
+    if not os.path.isdir(variant):
+        return False
+    path = overlay_path(dest)
+    os.makedirs(path, exist_ok=True)
+    changed = False
+
+    # index.theme: verbatim copy of the original + marker
+    index_out = os.path.join(path, "index.theme")
+    src_index = os.path.join(src, "index.theme")
+    rewrite = (state == "none" or not os.path.isfile(index_out)
+               or os.path.getmtime(src_index) > os.path.getmtime(index_out))
+    if not rewrite:
+        with open(index_out, encoding="utf-8") as f:
+            rewrite = OVERLAY_MARKER not in f.read()  # upgrade legacy marker
+    if rewrite:
+        with open(src_index, encoding="utf-8") as f:
+            text = f.read()
+        text = text.replace("[Icon Theme]", "[Icon Theme]\n" + OVERLAY_MARKER, 1)
+        tmp = index_out + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, index_out)
+        changed = True
+
+    # never keep a cache here: the symlinks change and it would go stale
+    cache = os.path.join(path, "icon-theme.cache")
+    if os.path.exists(cache):
+        os.remove(cache)
+
+    wanted_links = {e: f"../{theme_id}/{e}" for e in os.listdir(variant)
+                    if e not in ("index.theme", "icon-theme.cache")}
+    for e in os.listdir(path):
+        p = os.path.join(path, e)
+        if os.path.islink(p) and e not in wanted_links:
+            os.remove(p)
+            changed = True
+    for e, target in wanted_links.items():
+        p = os.path.join(path, e)
+        if os.path.islink(p) and os.readlink(p) == target:
+            continue
+        tmp = p + ".new"
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        os.symlink(target, tmp)
+        os.replace(tmp, p)  # atomic swap
+        changed = True
+    return changed
+
+
+# --------------------------------------------------------------------------
+# Accent detection and automatic switching
+# --------------------------------------------------------------------------
+
+def gs_get(schema, key):
+    r = subprocess.run(["gsettings", "get", schema, key],
+                       capture_output=True, text=True)
+    return r.stdout.strip().strip("'") if r.returncode == 0 else None
+
+
+def gs_set(schema, key, value):
+    subprocess.run(["gsettings", "set", schema, key, value], check=False)
+
+
+def detect_accent():
+    """Accent name (e.g. 'grape'), or None if the GTK theme is not an elementary stylesheet."""
+    gtk_theme = gs_get("org.gnome.desktop.interface", "gtk-theme") or ""
+    if gtk_theme.startswith(STYLESHEET_PREFIX):
+        return gtk_theme[len(STYLESHEET_PREFIX):]
+    return None
+
+
+def target_for_accent(accent, pastel):
+    if accent in PALETTE:
+        return theme_id_for(accent, pastel)
+    return ACCENT_FALLBACK.get(accent)
+
+
+def is_managed(icon_theme):
+    """Only touch the icon theme if it is elementary or one of our variants."""
+    if icon_theme == "elementary":
+        return True
+    if icon_theme and icon_theme.startswith("elementary-"):
+        base = icon_theme[len("elementary-"):].removesuffix("-pastel")
+        return base in PALETTE
+    return False
+
+
+def sync(args, quiet=False):
+    accent = detect_accent()
+    if accent is None:
+        if not quiet:
+            log("the current GTK theme is not an elementary stylesheet; nothing to do")
+        return
+    target = target_for_accent(accent, args.pastel)
+    if target is None:
+        log(f"unknown accent '{accent}'; nothing to do")
+        return
+
+    if target != "elementary":
+        ensure_variant(args.source, args.dest, accent, args.pastel)
+
+    # The panel (wingpanel / Applications Menu) always uses "elementary",
+    # so the overlay follows the accent even if you picked another icon theme.
+    if update_overlay(args.source, args.dest, None if target == "elementary" else target):
+        log(f"panel / Applications Menu → {target}")
+
+    current = gs_get("org.gnome.desktop.interface", "icon-theme")
+    if not is_managed(current):
+        log(f"icon theme '{current}' was chosen by you; leaving it alone")
+        return
+
+    if current != target:
+        gs_set("org.gnome.desktop.interface", "icon-theme", target)
+        log(f"accent: {accent} → icons: {target}")
+    elif not quiet:
+        log(f"accent: {accent} → icons already set to {target}")
+
+
+def _pid_from(pidfile, needle):
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if needle in f.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def watcher_pid():
+    return _pid_from(PIDFILE, APP.encode())
+
+
+def watch(args):
+    other = watcher_pid()
+    if other and other != os.getpid():
+        log(f"watcher already running (PID {other})")
+        return
+
+    os.makedirs(os.path.dirname(PIDFILE), exist_ok=True)
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    state = {"child": None}
+
+    def stop(*_):
+        if state["child"] and state["child"].poll() is None:
+            state["child"].terminate()
+        try:
+            if watcher_pid() == os.getpid():
+                os.remove(PIDFILE)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    log("watching the accent color (Ctrl+C to quit)")
+    sync(args)
+    while True:
+        # "gsettings monitor" prints one line every time the key changes
+        child = subprocess.Popen(
+            ["gsettings", "monitor", "org.gnome.desktop.interface", "gtk-theme"],
+            stdout=subprocess.PIPE, text=True)
+        state["child"] = child
+        for _line in child.stdout:
+            try:
+                sync(args, quiet=True)
+            except Exception as e:  # never let the watcher die
+                log(f"error: {e}")
+        child.wait()
+        time.sleep(3)  # monitor exited (e.g. dconf restarted): reopen it
+        sync(args, quiet=True)
+
+
+def stop_watcher():
+    pid = watcher_pid()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        log(f"watcher stopped (PID {pid})")
+
+
+def cleanup_legacy():
+    """Remove an install made under the project's pre-release name."""
+    pid = _pid_from(LEGACY_PIDFILE, LEGACY_APP.encode())
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        log(f"stopped legacy watcher (PID {pid})")
+    for p in (LEGACY_AUTOSTART, LEGACY_BIN):
+        if os.path.exists(p):
+            os.remove(p)
+            log(f"removed legacy file: {p}")
+
+
+def install_autostart(args):
+    cleanup_legacy()
+
+    # 1) copy the script to ~/.local/bin (independent of where it was downloaded)
+    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
+    me = os.path.realpath(__file__)
+    if me != os.path.realpath(BIN_PATH):
+        shutil.copy2(me, BIN_PATH)
+    os.chmod(BIN_PATH, 0o755)
+
+    # 2) build every variant now so that switching is instant later
+    for c in PALETTE:
+        ensure_variant(args.source, args.dest, c, args.pastel)
+
+    # 3) autostart entry (run by Pantheon at login)
+    cmd = [sys.executable, BIN_PATH, "--watch"]
+    if args.pastel:
+        cmd.append("--pastel")
+    if args.source != DEFAULT_SOURCE:
+        cmd += ["--source", args.source]
+    if args.dest != DEFAULT_DEST:
+        cmd += ["--dest", args.dest]
+    exec_line = " ".join(f'"{c}"' if " " in c else c for c in cmd)
+    os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
+    with open(AUTOSTART, "w", encoding="utf-8") as f:
+        f.write("[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=Accent-colored folders\n"
+                "Comment=Recolor elementary folder icons to match the accent color\n"
+                f"Exec={exec_line}\n"
+                "NoDisplay=true\n"
+                "X-GNOME-Autostart-enabled=true\n")
+    log(f"autostart entry created: {AUTOSTART}")
+
+    # 4) start right away, no need to log out
+    stop_watcher()
+    os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
+    with open(LOGFILE, "w") as logf:
+        subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(1.5)
+    pid = watcher_pid()
+    log(f"watcher running (PID {pid})" if pid else f"could not start the watcher; see {LOGFILE}")
+
+
+def uninstall_autostart():
+    stop_watcher()
+    cleanup_legacy()
+    for p in (AUTOSTART, BIN_PATH):
+        if os.path.exists(p):
+            os.remove(p)
+            log(f"removed: {p}")
+
+
+def status(args):
+    accent = detect_accent()
+    current = gs_get("org.gnome.desktop.interface", "icon-theme")
+    print(f"detected accent : {accent or '(not an elementary stylesheet)'}")
+    print(f"expected theme  : {target_for_accent(accent, args.pastel) if accent else '-'}")
+    print(f"icon theme      : {current}")
+    st = overlay_state(args.dest)
+    panel = {"none": "original (no overlay)",
+             "ours": overlay_target(args.dest) or "original",
+             "foreign": f"{overlay_path(args.dest)} exists and is not ours"}[st]
+    print(f"panel/launcher  : {panel}")
+    pid = watcher_pid()
+    print(f"watcher         : {'running (PID %d)' % pid if pid else 'stopped'}")
+    print(f"autostart       : {'installed' if os.path.exists(AUTOSTART) else 'not installed'}")
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=APP,
+        description="Make elementary OS folder icons follow the accent color.")
+    ap.add_argument("colors", nargs="*",
+                    help="colors to generate (default: all). Choices: " + ", ".join(PALETTE))
+    ap.add_argument("--source", default=DEFAULT_SOURCE,
+                    help="original elementary icon theme (default: %(default)s)")
+    ap.add_argument("--dest", default=DEFAULT_DEST,
+                    help="where to install the variants (default: %(default)s)")
+    ap.add_argument("--pastel", action="store_true",
+                    help="use lighter shades (*-pastel variants)")
+    ap.add_argument("--apply", metavar="COLOR", help="generate and activate a fixed color")
+    ap.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--sync", action="store_true",
+                      help="apply the color matching the current accent once")
+    mode.add_argument("--watch", action="store_true",
+                      help="keep running and switch colors whenever the accent changes")
+    mode.add_argument("--install-autostart", action="store_true",
+                      help="enable automatic mode at every login (and start it now)")
+    mode.add_argument("--uninstall-autostart", action="store_true",
+                      help="disable automatic mode")
+    mode.add_argument("--status", action="store_true",
+                      help="show the detected accent and the watcher state")
+    mode.add_argument("--remove", action="store_true",
+                      help="disable automatic mode, delete the variants and restore the default")
+    args = ap.parse_args()
+
+    if args.status:
+        return status(args)
+    if args.uninstall_autostart:
+        return uninstall_autostart()
+
+    if args.remove:
+        uninstall_autostart()
+        current = gs_get("org.gnome.desktop.interface", "icon-theme") if shutil.which("gsettings") else None
+        if current and current != "elementary" and is_managed(current):
+            gs_set("org.gnome.desktop.interface", "icon-theme", "elementary")
+            log("icon theme restored to elementary")
+        if remove_overlay(args.dest):
+            log("panel overlay removed")
+        removed = 0
+        for name in (os.listdir(args.dest) if os.path.isdir(args.dest) else []):
+            if name != "elementary" and is_managed(name):
+                shutil.rmtree(os.path.join(args.dest, name))
+                removed += 1
+        log(f"{removed} variant(s) removed")
+        return
+
+    if not os.path.isfile(os.path.join(args.source, "index.theme")):
+        sys.exit(f"Original theme not found at {args.source}")
+
+    if args.sync or args.watch or args.install_autostart:
+        if not shutil.which("gsettings"):
+            sys.exit("The 'gsettings' command is required to detect the accent color.")
+        if args.sync:
+            return sync(args)
+        if args.watch:
+            return watch(args)
+        return install_autostart(args)
+
+    colors = [c.lower() for c in args.colors] or list(PALETTE)
+    if args.apply and args.apply.lower() not in colors:
+        colors.append(args.apply.lower())
+    bad = [c for c in colors if c not in PALETTE]
+    if bad:
+        sys.exit(f"Unknown color(s): {', '.join(bad)}. Choices: {', '.join(PALETTE)}")
+
+    os.makedirs(args.dest, exist_ok=True)
+    for c in colors:
+        theme_id, n = build_variant(args.source, args.dest, c, args.pastel)
+        print(f"✔ {theme_id:28s} {n} icons")
+
+    if args.apply:
+        theme_id = theme_id_for(args.apply.lower(), args.pastel)
+        if watcher_pid():
+            print("\nNote: automatic mode is on and will switch colors again when the "
+                  "accent changes. Use --uninstall-autostart to keep a fixed color.")
+        update_overlay(args.source, args.dest, theme_id)
+        if shutil.which("gsettings"):
+            gs_set("org.gnome.desktop.interface", "icon-theme", theme_id)
+            print(f"\nActive theme: {theme_id}")
+        else:
+            print(f"\n  gsettings set org.gnome.desktop.interface icon-theme '{theme_id}'")
+    else:
+        print("\nTo follow the accent color automatically:")
+        print(f"  {APP} --install-autostart")
+
+
+if __name__ == "__main__":
+    main()
